@@ -434,7 +434,7 @@ namespace ChnnAsn.Montage
             {
                 graph.Disconnect(runtime.Slot.Mixer, runtime.InputPort);
                 graph.DestroyPlayable(runtime.ClipPlayable);
-                runtime.ClipPlayable = AnimationClipPlayable.Null;
+                runtime.ClipPlayable = default;
             }
             runtime.Segment = segment;
             if (segment == null || segment.Clip == null)

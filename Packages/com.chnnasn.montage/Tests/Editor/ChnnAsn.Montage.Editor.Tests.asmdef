@@ -2,7 +2,8 @@
   "name": "ChnnAsn.Montage.Editor.Tests",
   "rootNamespace": "ChnnAsn.Montage.Tests",
   "references": [
-    "ChnnAsn.Montage.Runtime"
+    "ChnnAsn.Montage.Runtime",
+    "ChnnAsn.Montage.Editor"
   ],
   "includePlatforms": [
     "Editor"
