@@ -1,0 +1,14 @@
+{
+  "name": "ChnnAsn.Montage.Runtime",
+  "rootNamespace": "ChnnAsn.Montage",
+  "references": [],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

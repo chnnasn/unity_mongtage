@@ -1,0 +1,24 @@
+{
+  "name": "com.chnnasn.montage",
+  "version": "0.1.0",
+  "displayName": "Unity Montage",
+  "description": "A section, slot and notify based animation montage system built on Unity Playables.",
+  "unity": "2022.3",
+  "author": {
+    "name": "chnnasn"
+  },
+  "keywords": [
+    "animation",
+    "playables",
+    "montage",
+    "combo",
+    "root-motion"
+  ],
+  "samples": [
+    {
+      "displayName": "Basic Playback",
+      "description": "Play a montage from gameplay code.",
+      "path": "Samples~/BasicPlayback"
+    }
+  ]
+}
