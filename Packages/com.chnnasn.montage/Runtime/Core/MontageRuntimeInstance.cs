@@ -19,10 +19,14 @@ namespace ChnnAsn.Montage
         public bool FadingIn;
         public bool FadingOut;
         public bool HoldTime;
+        public bool Paused;
+        public bool Removed;
+        public int PositionRevision;
         public MontageStopReason StopReason;
         public readonly List<MontageTrackRuntime> Tracks = new List<MontageTrackRuntime>();
         public readonly HashSet<MontageNotify> ActiveNotifies = new HashSet<MontageNotify>();
         public readonly Dictionary<string, string> NextSections = new Dictionary<string, string>();
+        public readonly List<MontageNotify> NotifyScratch = new List<MontageNotify>();
     }
 
     internal sealed class MontageTrackRuntime

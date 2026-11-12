@@ -8,6 +8,15 @@
 Packages/com.chnnasn.montage
 ```
 
+## 可运行 Demo
+
+打开 `Assets/MontageDemo/Scenes/MontageDemo.unity` 后进入 Play Mode，即可体验
+Section 串联、Notify、混合、跳段、停止和播放速率控制。Demo 也准备了
+`DemoCharacter.prefab` 与 `DemoAttackMontage.asset`，可以直接放进
+**Window > Animation > Unity Montage** 预览窗口中播放和拖动时间轴。
+
+![Montage Demo](Assets/MontageDemo/Preview.png)
+
 ## 开发
 
 使用 Unity `2022.3.48f1` 打开仓库根目录。插件作为 Embedded Package 被项目直接引用，修改包内源码后 Unity 会自动重新编译。

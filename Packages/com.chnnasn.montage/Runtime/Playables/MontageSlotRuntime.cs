@@ -52,7 +52,8 @@ namespace ChnnAsn.Montage
             if (!Tracks.Remove(port))
                 return;
             freePorts.Push(port);
-            Mixer.SetInputWeight(port, 0f);
+            if (Mixer.IsValid())
+                Mixer.SetInputWeight(port, 0f);
         }
     }
 }

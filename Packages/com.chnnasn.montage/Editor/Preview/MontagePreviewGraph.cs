@@ -137,13 +137,7 @@ namespace ChnnAsn.Montage.Editor
                     continue;
 
                 var source = active.Segment;
-                var localTime = Mathf.Max(0f, montageTime - source.StartTime) * source.PlayRate;
-                var available = Mathf.Max(0f, source.Clip.length - source.ClipIn);
-                if (source.Loop && available > 0f)
-                    localTime %= available;
-                else
-                    localTime = Mathf.Min(localTime, available);
-                active.Playable.SetTime(source.ClipIn + localTime);
+                active.Playable.SetTime(source.GetClipTime(montageTime));
             }
 
             graph.Evaluate(Mathf.Max(0f, deltaTime));

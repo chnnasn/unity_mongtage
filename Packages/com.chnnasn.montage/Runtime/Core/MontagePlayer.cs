@@ -8,7 +8,7 @@ namespace ChnnAsn.Montage
 {
     [DisallowMultipleComponent]
     [RequireComponent(typeof(Animator))]
-    public sealed class MontagePlayer : MonoBehaviour
+    public sealed partial class MontagePlayer : MonoBehaviour
     {
         [SerializeField] private Animator animator;
         [SerializeField] private bool logValidationErrors = true;
@@ -22,11 +22,19 @@ namespace ChnnAsn.Montage
         private AnimationLayerMixerPlayable layerMixer;
         private int nextInstanceId = 1;
         private bool initialized;
+        private bool shuttingDown;
+        private readonly List<MontageRuntimeInstance> updateSnapshot = new List<MontageRuntimeInstance>();
 
         public event Action<MontageHandle> Started;
         public event Action<MontageHandle, string, string> SectionChanged;
         public event Action<MontageNotifyContext> NotifyTriggered;
         public event Action<MontageHandle, MontageStopReason> Ended;
+        public event Action<MontageHandle, MontageStopReason> BlendingOut;
+        public event Action<MontageHandle> Completed;
+        public event Action<MontageHandle> Interrupted;
+        public event Action<MontageNotifyContext> NotifyStateBegin;
+        public event Action<MontageNotifyContext> NotifyStateTick;
+        public event Action<MontageNotifyContext> NotifyStateEnd;
 
         public Animator Animator => animator;
 
@@ -45,16 +53,27 @@ namespace ChnnAsn.Montage
             if (!initialized)
                 return;
 
-            var deltaTime = Time.deltaTime;
-            for (var i = instances.Count - 1; i >= 0; i--)
-            {
-                var instance = instances[i];
-                UpdateInstance(instance, deltaTime);
-                if (instance.FadingOut && instance.Weight <= 0f)
-                    RemoveInstanceAt(i);
-            }
+            Tick(Time.deltaTime);
+        }
 
-            UpdateSlotWeights();
+        // Kept separate from Update for deterministic editor regression tests.
+        private void Tick(float deltaTime)
+        {
+            if (!initialized || deltaTime < 0f || float.IsNaN(deltaTime) || float.IsInfinity(deltaTime))
+                return;
+            updateSnapshot.Clear();
+            updateSnapshot.AddRange(instances);
+            for (var i = 0; i < updateSnapshot.Count; i++)
+            {
+                var instance = updateSnapshot[i];
+                if (instance.Removed)
+                    continue;
+                UpdateInstance(instance, deltaTime);
+                if (!instance.Removed && instance.FadingOut && instance.Weight <= 0f)
+                    RemoveInstance(instance);
+            }
+            if (initialized)
+                UpdateSlotWeights();
         }
 
         private void OnDisable()
@@ -96,13 +115,18 @@ namespace ChnnAsn.Montage
 
         public MontageHandle Play(MontageAsset montage)
         {
-            return Play(montage, MontagePlayOptions.Default);
+            var options = MontagePlayOptions.Default;
+            if (montage != null)
+                options.PlayRate = montage.DefaultPlayRate;
+            return Play(montage, options);
         }
 
         public MontageHandle Play(MontageAsset montage, MontagePlayOptions options)
         {
             if (montage == null)
                 throw new ArgumentNullException(nameof(montage));
+            if (shuttingDown || !isActiveAndEnabled)
+                return default;
             Initialize();
 
             validationErrors.Clear();
@@ -127,29 +151,28 @@ namespace ChnnAsn.Montage
             for (var i = 0; i < instances.Count; i++)
             {
                 var current = instances[i];
-                if (!SharesSlot(current.Asset, montage) || current.FadingOut)
+                if (!ConflictsWith(current.Asset, montage) || current.FadingOut)
                     continue;
                 if (current.Priority > priority)
                     return default;
             }
 
-            for (var i = 0; i < instances.Count; i++)
-            {
-                var current = instances[i];
-                if (SharesSlot(current.Asset, montage) && !current.FadingOut)
-                    BeginFadeOut(current, current.Asset.BlendOut, MontageStopReason.Interrupted);
-            }
-
+            var previousInstances = instances.ToArray();
+            var startTime = startSection != null ? startSection.StartTime : Mathf.Clamp(options.StartTime, 0f, montage.Duration);
+            if (float.IsNaN(startTime) || float.IsInfinity(startTime) ||
+                float.IsNaN(options.BlendIn) || float.IsInfinity(options.BlendIn) ||
+                float.IsNaN(options.PlayRate) || float.IsInfinity(options.PlayRate))
+                return default;
             var blendIn = options.BlendIn >= 0f ? options.BlendIn : montage.BlendIn;
             var instance = new MontageRuntimeInstance
             {
                 Id = nextInstanceId++,
                 Asset = montage,
-                Time = startSection != null ? startSection.StartTime : 0f,
+                Time = startTime,
                 Weight = blendIn <= 0f ? 1f : 0f,
                 PlayRate = options.PlayRate > 0f ? options.PlayRate : montage.DefaultPlayRate,
                 Priority = priority,
-                CurrentSection = startSection != null ? startSection.Name : FindInitialSection(montage),
+                CurrentSection = startSection != null ? startSection.Name : montage.FindSectionAtTime(startTime)?.Name,
                 FadeDuration = blendIn,
                 FadingIn = blendIn > 0f
             };
@@ -167,17 +190,35 @@ namespace ChnnAsn.Montage
 
             instances.Add(instance);
             UpdateTrackPlayables(instance);
-            DispatchAtCurrentTime(instance, 0f);
-            UpdateSlotWeights();
             var handle = new MontageHandle(this, instance.Id);
+            for (var i = 0; i < previousInstances.Length; i++)
+            {
+                var current = previousInstances[i];
+                if (!current.Removed && ConflictsWith(current.Asset, montage))
+                    BeginFadeOut(current, current.Asset.BlendOut, MontageStopReason.Interrupted);
+            }
+            if (instance.Removed)
+                return default;
+            var startRevision = instance.PositionRevision;
             Started?.Invoke(handle);
+            if (CanDispatch(instance) && instance.PositionRevision == startRevision)
+                DispatchAtCurrentTime(instance, 0f);
+            if (initialized)
+                UpdateSlotWeights();
             return handle;
         }
 
         public void StopAll(float blendOut = 0.2f)
         {
-            for (var i = 0; i < instances.Count; i++)
-                BeginFadeOut(instances[i], blendOut, MontageStopReason.Stopped);
+            foreach (var instance in instances.ToArray())
+                BeginFadeOut(instance, blendOut, MontageStopReason.Stopped);
+        }
+
+        public void StopGroup(string group, float blendOut = -1f)
+        {
+            foreach (var instance in instances.ToArray())
+                if (string.Equals(instance.Asset.SlotGroup, group, StringComparison.Ordinal))
+                    BeginFadeOut(instance, blendOut >= 0f ? blendOut : instance.Asset.BlendOut, MontageStopReason.Stopped);
         }
 
         public bool IsPlaying(MontageAsset montage)
@@ -193,6 +234,39 @@ namespace ChnnAsn.Montage
         internal float GetTime(int id) => FindInstance(id)?.Time ?? 0f;
         internal float GetWeight(int id) => FindInstance(id)?.Weight ?? 0f;
         internal string GetCurrentSection(int id) => FindInstance(id)?.CurrentSection;
+        internal bool GetPaused(int id) => FindInstance(id)?.Paused ?? false;
+        internal bool GetBlendingOut(int id) => FindInstance(id)?.FadingOut ?? false;
+        internal float GetPlayRate(int id) => FindInstance(id)?.PlayRate ?? 0f;
+        internal float GetCurveValue(int id, string name)
+        {
+            var instance = FindInstance(id);
+            return instance != null ? instance.Asset.EvaluateCurve(name, instance.Time) : 0f;
+        }
+
+        internal bool SetPaused(int id, bool paused)
+        {
+            var instance = FindInstance(id);
+            if (instance == null)
+                return false;
+            instance.Paused = paused;
+            return true;
+        }
+
+        internal bool SetPosition(int id, float time)
+        {
+            var instance = FindInstance(id);
+            if (instance == null || instance.FadingOut || float.IsNaN(time) || float.IsInfinity(time))
+                return false;
+            time = Mathf.Clamp(time, 0f, instance.Asset.Duration);
+            MoveTo(instance, time, instance.Asset.FindSectionAtTime(time)?.Name);
+            return true;
+        }
+
+        internal bool ClearNextSection(int id, string from)
+        {
+            var instance = FindInstance(id);
+            return instance != null && from != null && instance.NextSections.Remove(from);
+        }
 
         internal bool Stop(int id, float blendOut)
         {
@@ -206,7 +280,7 @@ namespace ChnnAsn.Montage
         internal bool SetPlayRate(int id, float playRate)
         {
             var instance = FindInstance(id);
-            if (instance == null || playRate <= 0f)
+            if (instance == null || playRate <= 0f || float.IsNaN(playRate) || float.IsInfinity(playRate))
                 return false;
             instance.PlayRate = playRate;
             return true;
@@ -216,17 +290,9 @@ namespace ChnnAsn.Montage
         {
             var instance = FindInstance(id);
             var section = instance?.Asset.FindSection(sectionName);
-            if (instance == null || section == null)
+            if (instance == null || section == null || instance.FadingOut)
                 return false;
-
-            CloseActiveNotifies(instance, 0f);
-            var previous = instance.CurrentSection;
-            instance.CurrentSection = section.Name;
-            instance.Time = section.StartTime;
-            instance.HoldTime = false;
-            UpdateTrackPlayables(instance);
-            DispatchAtCurrentTime(instance, 0f);
-            SectionChanged?.Invoke(new MontageHandle(this, id), previous, section.Name);
+            MoveTo(instance, section.StartTime, section.Name);
             return true;
         }
 
@@ -241,172 +307,6 @@ namespace ChnnAsn.Montage
             return true;
         }
 
-        private void UpdateInstance(MontageRuntimeInstance instance, float deltaTime)
-        {
-            if (!instance.HoldTime)
-            {
-                if (instance.FadingOut)
-                    instance.Time = Mathf.Min(instance.Asset.Duration, instance.Time + deltaTime * instance.PlayRate);
-                else
-                    AdvanceTime(instance, deltaTime * instance.PlayRate, deltaTime);
-            }
-
-            if (instance.FadingIn)
-            {
-                instance.FadeElapsed += deltaTime;
-                instance.Weight = instance.FadeDuration <= 0f
-                    ? 1f
-                    : Mathf.Clamp01(instance.FadeElapsed / instance.FadeDuration);
-                if (instance.Weight >= 1f)
-                    instance.FadingIn = false;
-            }
-            else if (instance.FadingOut)
-            {
-                instance.FadeElapsed += deltaTime;
-                var t = instance.FadeDuration <= 0f ? 1f : Mathf.Clamp01(instance.FadeElapsed / instance.FadeDuration);
-                instance.Weight = Mathf.Lerp(instance.FadeStartWeight, 0f, t);
-            }
-
-            TickActiveNotifies(instance, deltaTime);
-            UpdateTrackPlayables(instance);
-        }
-
-        private void AdvanceTime(MontageRuntimeInstance instance, float amount, float frameDelta)
-        {
-            var remaining = amount;
-            for (var guard = 0; guard < 32 && remaining > 0f; guard++)
-            {
-                var section = instance.Asset.FindSection(instance.CurrentSection);
-                var limit = section != null ? section.EndTime : instance.Asset.Duration;
-                var target = instance.Time + remaining;
-                if (target < limit)
-                {
-                    DispatchRange(instance, instance.Time, target, frameDelta);
-                    instance.Time = target;
-                    return;
-                }
-
-                DispatchRange(instance, instance.Time, limit, frameDelta);
-                remaining = target - limit;
-                instance.Time = limit;
-
-                if (section == null)
-                {
-                    BeginFadeOut(instance, instance.Asset.BlendOut, MontageStopReason.Completed);
-                    instance.HoldTime = true;
-                    return;
-                }
-
-                var nextName = instance.NextSections.TryGetValue(section.Name, out var overridden)
-                    ? overridden
-                    : section.NextSection;
-                var next = instance.Asset.FindSection(nextName);
-                if (next == null)
-                {
-                    BeginFadeOut(instance, instance.Asset.BlendOut, MontageStopReason.Completed);
-                    instance.HoldTime = true;
-                    return;
-                }
-
-                var previousName = instance.CurrentSection;
-                instance.CurrentSection = next.Name;
-                instance.Time = next.StartTime;
-                DispatchAtCurrentTime(instance, frameDelta);
-                SectionChanged?.Invoke(new MontageHandle(this, instance.Id), previousName, next.Name);
-            }
-
-            if (remaining > 0f)
-            {
-                Debug.LogError($"Montage '{instance.Asset.name}' exceeded 32 section transitions in one frame.", instance.Asset);
-                BeginFadeOut(instance, 0f, MontageStopReason.Stopped);
-            }
-        }
-
-        private void DispatchRange(MontageRuntimeInstance instance, float from, float to, float deltaTime)
-        {
-            if (to < from)
-                return;
-            var handle = new MontageHandle(this, instance.Id);
-            for (var i = 0; i < instance.Asset.Notifies.Count; i++)
-            {
-                var notify = instance.Asset.Notifies[i];
-                if (notify == null || notify.Asset == null)
-                    continue;
-
-                if (!notify.IsState)
-                {
-                    if (notify.Time > from && notify.Time <= to)
-                    {
-                        var context = new MontageNotifyContext(this, instance.Asset, handle, notify, notify.Time, deltaTime);
-                        notify.Asset.OnNotify(context);
-                        NotifyTriggered?.Invoke(context);
-                    }
-                    continue;
-                }
-
-                if (notify.Time > from && notify.Time <= to && instance.ActiveNotifies.Add(notify))
-                    notify.Asset.OnBegin(new MontageNotifyContext(this, instance.Asset, handle, notify, notify.Time, deltaTime));
-                if (notify.EndTime > from && notify.EndTime <= to && instance.ActiveNotifies.Remove(notify))
-                    notify.Asset.OnEnd(new MontageNotifyContext(this, instance.Asset, handle, notify, notify.EndTime, deltaTime));
-            }
-        }
-
-        private void DispatchAtCurrentTime(MontageRuntimeInstance instance, float deltaTime)
-        {
-            var handle = new MontageHandle(this, instance.Id);
-            for (var i = 0; i < instance.Asset.Notifies.Count; i++)
-            {
-                var notify = instance.Asset.Notifies[i];
-                if (notify == null || notify.Asset == null || !Mathf.Approximately(notify.Time, instance.Time))
-                    continue;
-                var context = new MontageNotifyContext(this, instance.Asset, handle, notify, instance.Time, deltaTime);
-                if (notify.IsState)
-                {
-                    if (instance.ActiveNotifies.Add(notify))
-                        notify.Asset.OnBegin(context);
-                }
-                else
-                {
-                    notify.Asset.OnNotify(context);
-                    NotifyTriggered?.Invoke(context);
-                }
-            }
-        }
-
-        private void TickActiveNotifies(MontageRuntimeInstance instance, float deltaTime)
-        {
-            if (instance.ActiveNotifies.Count == 0)
-                return;
-            var handle = new MontageHandle(this, instance.Id);
-            foreach (var notify in instance.ActiveNotifies)
-                notify.Asset?.OnTick(new MontageNotifyContext(this, instance.Asset, handle, notify, instance.Time, deltaTime));
-        }
-
-        private void CloseActiveNotifies(MontageRuntimeInstance instance, float deltaTime)
-        {
-            if (instance.ActiveNotifies.Count == 0)
-                return;
-            var handle = new MontageHandle(this, instance.Id);
-            foreach (var notify in instance.ActiveNotifies)
-                notify.Asset?.OnEnd(new MontageNotifyContext(this, instance.Asset, handle, notify, instance.Time, deltaTime));
-            instance.ActiveNotifies.Clear();
-        }
-
-        private void BeginFadeOut(MontageRuntimeInstance instance, float duration, MontageStopReason reason)
-        {
-            if (instance.FadingOut)
-                return;
-            instance.FadingIn = false;
-            instance.FadingOut = true;
-            instance.FadeElapsed = 0f;
-            instance.FadeDuration = Mathf.Max(0f, duration);
-            instance.FadeStartWeight = instance.Weight;
-            instance.StopReason = reason;
-            CloseActiveNotifies(instance, 0f);
-            if (instance.FadeDuration <= 0f)
-                instance.Weight = 0f;
-        }
-
         private void UpdateTrackPlayables(MontageRuntimeInstance instance)
         {
             for (var i = 0; i < instance.Tracks.Count; i++)
@@ -418,13 +318,7 @@ namespace ChnnAsn.Montage
                 if (!runtime.HasPlayable || segment == null)
                     continue;
 
-                var localTime = Mathf.Max(0f, instance.Time - segment.StartTime) * segment.PlayRate;
-                var available = Mathf.Max(0f, segment.Clip.length - segment.ClipIn);
-                if (segment.Loop && available > 0f)
-                    localTime %= available;
-                else
-                    localTime = Mathf.Min(localTime, available);
-                runtime.ClipPlayable.SetTime(segment.ClipIn + localTime);
+                runtime.ClipPlayable.SetTime(segment.GetClipTime(instance.Time));
             }
         }
 
@@ -496,9 +390,12 @@ namespace ChnnAsn.Montage
             }
         }
 
-        private void RemoveInstanceAt(int index)
+        private void RemoveInstance(MontageRuntimeInstance instance)
         {
-            var instance = instances[index];
+            if (instance.Removed)
+                return;
+            instance.Removed = true;
+            instances.Remove(instance);
             CloseActiveNotifies(instance, 0f);
             for (var i = 0; i < instance.Tracks.Count; i++)
             {
@@ -510,8 +407,10 @@ namespace ChnnAsn.Montage
                 }
                 track.Slot.Release(track.InputPort);
             }
-            instances.RemoveAt(index);
-            Ended?.Invoke(new MontageHandle(this, instance.Id), instance.StopReason);
+            var handle = new MontageHandle(this, instance.Id);
+            Ended?.Invoke(handle, instance.StopReason);
+            if (instance.StopReason == MontageStopReason.Completed)
+                Completed?.Invoke(handle);
         }
 
         private MontageRuntimeInstance FindInstance(int id)
@@ -524,22 +423,26 @@ namespace ChnnAsn.Montage
 
         private void Shutdown(MontageStopReason reason)
         {
-            if (!initialized)
+            if (!initialized || shuttingDown)
                 return;
-            for (var i = instances.Count - 1; i >= 0; i--)
+            shuttingDown = true;
+            foreach (var instance in instances.ToArray())
             {
-                instances[i].StopReason = reason;
-                instances[i].Weight = 0f;
-                RemoveInstanceAt(i);
+                instance.StopReason = reason;
+                instance.Weight = 0f;
+                RemoveInstance(instance);
             }
             slots.Clear();
             if (graph.IsValid())
                 graph.Destroy();
             initialized = false;
+            shuttingDown = false;
         }
 
-        private static bool SharesSlot(MontageAsset left, MontageAsset right)
+        private static bool ConflictsWith(MontageAsset left, MontageAsset right)
         {
+            if (!string.IsNullOrEmpty(left.SlotGroup) && string.Equals(left.SlotGroup, right.SlotGroup, StringComparison.Ordinal))
+                return true;
             for (var i = 0; i < left.SlotTracks.Count; i++)
             {
                 var leftTrack = left.SlotTracks[i];
@@ -555,15 +458,5 @@ namespace ChnnAsn.Montage
             return false;
         }
 
-        private static string FindInitialSection(MontageAsset montage)
-        {
-            for (var i = 0; i < montage.Sections.Count; i++)
-            {
-                var section = montage.Sections[i];
-                if (section != null && section.StartTime <= 0f && section.EndTime > 0f)
-                    return section.Name;
-            }
-            return null;
-        }
     }
 }

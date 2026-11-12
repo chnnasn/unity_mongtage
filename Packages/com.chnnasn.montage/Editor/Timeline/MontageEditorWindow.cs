@@ -1,10 +1,11 @@
 using System;
 using UnityEditor;
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace ChnnAsn.Montage.Editor
 {
-    internal sealed class MontageEditorWindow : EditorWindow
+    internal sealed partial class MontageEditorWindow : EditorWindow
     {
         private const float HeaderWidth = 140f;
         private const float RowHeight = 28f;
@@ -16,6 +17,9 @@ namespace ChnnAsn.Montage.Editor
         private PreviewRenderUtility previewUtility;
         private GameObject previewInstance;
         private MontagePreviewGraph previewGraph;
+        private Mesh previewGridMesh;
+        private Material previewGridMaterial;
+        private Vector3 previewGridCenter;
         private Vector2 timelineScroll;
         private Vector2 orbit = new Vector2(180f, 12f);
         private Vector3 cameraFocus;
@@ -29,6 +33,9 @@ namespace ChnnAsn.Montage.Editor
         private bool pendingRebuild;
         private double previousEditorTime;
         private string previewError;
+        private AudioClip pendingAudioClip;
+        private GameObject pendingVfxPrefab;
+        private int selectedNotifyIndex = -1;
 
         [MenuItem("Window/Animation/Unity Montage")]
         public static void OpenWindow()
@@ -45,7 +52,7 @@ namespace ChnnAsn.Montage.Editor
 
         private void OnEnable()
         {
-            minSize = new Vector2(560f, 520f);
+            minSize = new Vector2(580f, 440f);
             previousEditorTime = EditorApplication.timeSinceStartup;
             EditorApplication.update += OnEditorUpdate;
             EditorApplication.projectChanged += OnProjectChanged;
@@ -65,11 +72,13 @@ namespace ChnnAsn.Montage.Editor
             if (pendingRebuild)
             {
                 pendingRebuild = false;
+                var savedTime = currentTime;
                 RebuildPreview();
+                SetTime(savedTime);
             }
 
             DrawAssetToolbar();
-            DrawPreviewArea();
+            DrawResizableWorkspace();
             DrawPlaybackToolbar();
             DrawTimeControls();
 
@@ -79,12 +88,18 @@ namespace ChnnAsn.Montage.Editor
                 return;
             }
 
+            DrawAuthoringToolbar();
+            DrawEventCreationToolbar();
+            HandleDeleteKey();
             timelineScroll = EditorGUILayout.BeginScrollView(timelineScroll);
-            DrawRuler(montage.Duration);
-            DrawSections(montage.Duration);
+            DrawRuler(TimelineDuration);
+            DrawSections(TimelineDuration);
             for (var i = 0; i < montage.SlotTracks.Count; i++)
-                DrawTrack(montage.SlotTracks[i], montage.Duration, i);
-            DrawNotifies(montage.Duration);
+                DrawTrack(montage.SlotTracks[i], TimelineDuration, i);
+            DrawAudioEvents(TimelineDuration);
+            DrawVfxEvents(TimelineDuration);
+            DrawNotifies(TimelineDuration);
+            DrawCurves(TimelineDuration);
             EditorGUILayout.EndScrollView();
         }
 
@@ -113,6 +128,8 @@ namespace ChnnAsn.Montage.Editor
                     RebuildPreview();
 
                 GUILayout.FlexibleSpace();
+                if (GUILayout.Button("IK Retargeter", GUILayout.Width(110f)))
+                    IKRetargeterWindow.OpenWindow();
                 using (new EditorGUI.DisabledScope(montage == null || previewCharacter == null))
                 {
                     if (GUILayout.Button("Rebuild Preview", GUILayout.Width(120f)))
@@ -121,10 +138,8 @@ namespace ChnnAsn.Montage.Editor
             }
         }
 
-        private void DrawPreviewArea()
+        private void DrawPreviewArea(Rect rect)
         {
-            var height = Mathf.Clamp(position.height * 0.44f, 220f, 460f);
-            var rect = GUILayoutUtility.GetRect(100f, height, GUILayout.ExpandWidth(true));
             EditorGUI.DrawRect(rect, new Color(0.11f, 0.11f, 0.11f));
 
             if (previewUtility == null || previewInstance == null)
@@ -139,13 +154,14 @@ namespace ChnnAsn.Montage.Editor
             HandlePreviewInput(rect);
             UpdatePreviewCamera(rect);
             previewUtility.BeginPreview(rect, GUIStyle.none);
+            DrawPreviewGrid();
             previewUtility.Render(true);
             var texture = previewUtility.EndPreview();
             GUI.DrawTexture(rect, texture, ScaleMode.StretchToFill, false);
             GUI.Box(rect, GUIContent.none);
 
             var hintRect = new Rect(rect.x + 8f, rect.yMax - 24f, rect.width - 16f, 18f);
-            GUI.Label(hintRect, "LMB Orbit   MMB Pan   Wheel Zoom   F Frame", EditorStyles.miniLabel);
+            GUI.Label(hintRect, "RMB Orbit   MMB Pan   Wheel Zoom   F Frame", EditorStyles.miniLabel);
             if (!string.IsNullOrEmpty(previewError))
                 GUI.Label(new Rect(rect.x + 8f, rect.y + 8f, rect.width - 16f, 36f), previewError, EditorStyles.helpBox);
         }
@@ -175,12 +191,12 @@ namespace ChnnAsn.Montage.Editor
                 if (GUILayout.Button("-1f", EditorStyles.toolbarButton, GUILayout.Width(38f)))
                 {
                     isPlaying = false;
-                    SetTime(currentTime - 1f / 30f);
+                    SetTime(currentTime - 1f / frameRate);
                 }
                 if (GUILayout.Button("+1f", EditorStyles.toolbarButton, GUILayout.Width(38f)))
                 {
                     isPlaying = false;
-                    SetTime(currentTime + 1f / 30f);
+                    SetTime(currentTime + 1f / frameRate);
                 }
 
                 GUILayout.Space(8f);
@@ -217,6 +233,36 @@ namespace ChnnAsn.Montage.Editor
             }
         }
 
+        private void DrawEventCreationToolbar()
+        {
+            using (new EditorGUILayout.HorizontalScope(EditorStyles.helpBox))
+            {
+                GUILayout.Label("Audio", GUILayout.Width(34f));
+                pendingAudioClip = (AudioClip)EditorGUILayout.ObjectField(
+                    pendingAudioClip, typeof(AudioClip), false, GUILayout.MinWidth(45f));
+                using (new EditorGUI.DisabledScope(pendingAudioClip == null))
+                {
+                    if (GUILayout.Button("+", GUILayout.Width(25f)))
+                    {
+                        AddAudioEvent(pendingAudioClip, currentTime);
+                        pendingAudioClip = null;
+                    }
+                }
+                GUILayout.Space(6f);
+                GUILayout.Label("VFX", GUILayout.Width(26f));
+                pendingVfxPrefab = (GameObject)EditorGUILayout.ObjectField(
+                    pendingVfxPrefab, typeof(GameObject), false, GUILayout.MinWidth(45f));
+                using (new EditorGUI.DisabledScope(pendingVfxPrefab == null))
+                {
+                    if (GUILayout.Button("+", GUILayout.Width(25f)))
+                    {
+                        AddVfxEvent(pendingVfxPrefab, currentTime);
+                        pendingVfxPrefab = null;
+                    }
+                }
+            }
+        }
+
         private void OnEditorUpdate()
         {
             var now = EditorApplication.timeSinceStartup;
@@ -233,6 +279,13 @@ namespace ChnnAsn.Montage.Editor
             }
 
             var scaledDelta = (float)delta * PlaybackSpeeds[Mathf.Clamp(speedIndex, 0, PlaybackSpeeds.Length - 1)];
+            if (followSectionLinks && sectionIndex == 0 && montage.Sections.Count > 0)
+            {
+                AdvanceSectionPreview(scaledDelta);
+                previewGraph.Sample(currentTime, scaledDelta);
+                Repaint();
+                return;
+            }
             var nextTime = currentTime + scaledDelta;
             if (nextTime >= end)
             {
@@ -250,9 +303,13 @@ namespace ChnnAsn.Montage.Editor
             Repaint();
         }
 
-        private void SetMontage(MontageAsset asset)
+        internal void SetMontage(MontageAsset asset)
         {
             montage = asset;
+            selectionKind = SelectionKind.Asset;
+            selectedNotifyIndex = -1;
+            selectedTrackIndex = -1;
+            selectedElementIndex = -1;
             sectionIndex = 0;
             currentTime = 0f;
             isPlaying = false;
@@ -318,6 +375,12 @@ namespace ChnnAsn.Montage.Editor
             previewGraph?.Dispose();
             previewGraph = null;
             previewInstance = null;
+            if (previewGridMesh != null)
+                DestroyImmediate(previewGridMesh);
+            previewGridMesh = null;
+            if (previewGridMaterial != null)
+                DestroyImmediate(previewGridMaterial);
+            previewGridMaterial = null;
             if (previewUtility != null)
             {
                 previewUtility.Cleanup();
@@ -334,6 +397,7 @@ namespace ChnnAsn.Montage.Editor
             {
                 cameraFocus = previewInstance.transform.position + Vector3.up;
                 cameraDistance = 3f;
+                BuildPreviewGrid(previewInstance.transform.position, 4f);
                 return;
             }
 
@@ -342,6 +406,8 @@ namespace ChnnAsn.Montage.Editor
                 bounds.Encapsulate(renderers[i].bounds);
             cameraFocus = bounds.center;
             cameraDistance = Mathf.Max(0.5f, bounds.extents.magnitude * 2.6f);
+            BuildPreviewGrid(new Vector3(bounds.center.x, bounds.min.y, bounds.center.z),
+                Mathf.Max(2f, bounds.extents.magnitude * 2.4f));
         }
 
         private void UpdatePreviewCamera(Rect rect)
@@ -363,10 +429,15 @@ namespace ChnnAsn.Montage.Editor
             if (!rect.Contains(current.mousePosition))
                 return;
 
-            if (current.type == EventType.MouseDrag && current.button == 0)
+            if (current.type == EventType.MouseDown && current.button == 1)
             {
-                orbit.x += current.delta.x * 0.6f;
-                orbit.y = Mathf.Clamp(orbit.y - current.delta.y * 0.6f, -80f, 80f);
+                Focus();
+                current.Use();
+            }
+            else if (current.type == EventType.MouseDrag && current.button == 1)
+            {
+                orbit.x -= current.delta.x * 0.6f;
+                orbit.y = Mathf.Clamp(orbit.y + current.delta.y * 0.6f, -80f, 80f);
                 current.Use();
                 Repaint();
             }
@@ -392,10 +463,97 @@ namespace ChnnAsn.Montage.Editor
             }
         }
 
+        private void DrawPreviewGrid()
+        {
+            if (previewGridMesh == null || previewGridMaterial == null || previewUtility == null)
+                return;
+
+            previewUtility.DrawMesh(
+                previewGridMesh,
+                Matrix4x4.TRS(previewGridCenter, Quaternion.identity, Vector3.one),
+                previewGridMaterial,
+                0);
+        }
+
+        private void BuildPreviewGrid(Vector3 center, float halfExtent)
+        {
+            if (previewGridMesh != null)
+                DestroyImmediate(previewGridMesh);
+            previewGridMesh = CreateGridMesh(halfExtent, 20);
+            previewGridCenter = center;
+
+            if (previewGridMaterial != null)
+                return;
+            var shader = Shader.Find("Hidden/Internal-Colored");
+            if (shader == null)
+                shader = Shader.Find("Unlit/Color");
+            if (shader == null)
+                return;
+
+            previewGridMaterial = new Material(shader)
+            {
+                hideFlags = HideFlags.HideAndDontSave
+            };
+            previewGridMaterial.SetInt("_SrcBlend", (int)BlendMode.SrcAlpha);
+            previewGridMaterial.SetInt("_DstBlend", (int)BlendMode.OneMinusSrcAlpha);
+            previewGridMaterial.SetInt("_Cull", (int)CullMode.Off);
+            previewGridMaterial.SetInt("_ZWrite", 0);
+            previewGridMaterial.SetInt("_ZTest", (int)CompareFunction.LessEqual);
+        }
+
+        internal static Mesh CreateGridMesh(float halfExtent, int divisions)
+        {
+            halfExtent = Mathf.Max(0.5f, halfExtent);
+            divisions = Mathf.Clamp(divisions, 2, 100);
+            var lineCountPerAxis = divisions * 2 + 1;
+            var vertices = new Vector3[lineCountPerAxis * 4];
+            var colors = new Color[vertices.Length];
+            var indices = new int[vertices.Length];
+            var spacing = halfExtent / divisions;
+            var cursor = 0;
+
+            for (var i = -divisions; i <= divisions; i++)
+            {
+                var offset = i * spacing;
+                var isAxis = i == 0;
+                var isMajor = i % 5 == 0;
+                var xColor = isAxis
+                    ? new Color(0.72f, 0.22f, 0.22f, 0.75f)
+                    : isMajor ? new Color(0.42f, 0.45f, 0.5f, 0.5f) : new Color(0.3f, 0.32f, 0.36f, 0.28f);
+                var zColor = isAxis
+                    ? new Color(0.2f, 0.48f, 0.82f, 0.75f)
+                    : isMajor ? new Color(0.42f, 0.45f, 0.5f, 0.5f) : new Color(0.3f, 0.32f, 0.36f, 0.28f);
+
+                vertices[cursor] = new Vector3(-halfExtent, 0f, offset);
+                vertices[cursor + 1] = new Vector3(halfExtent, 0f, offset);
+                colors[cursor] = colors[cursor + 1] = xColor;
+                cursor += 2;
+
+                vertices[cursor] = new Vector3(offset, 0f, -halfExtent);
+                vertices[cursor + 1] = new Vector3(offset, 0f, halfExtent);
+                colors[cursor] = colors[cursor + 1] = zColor;
+                cursor += 2;
+            }
+
+            for (var i = 0; i < indices.Length; i++)
+                indices[i] = i;
+
+            var mesh = new Mesh
+            {
+                name = "Montage Preview Grid",
+                hideFlags = HideFlags.HideAndDontSave
+            };
+            mesh.vertices = vertices;
+            mesh.colors = colors;
+            mesh.SetIndices(indices, MeshTopology.Lines, 0);
+            mesh.RecalculateBounds();
+            return mesh;
+        }
+
         private void DrawRuler(float duration)
         {
             duration = Mathf.Max(0.001f, duration);
-            var rect = GUILayoutUtility.GetRect(position.width - 20f, 24f);
+            var rect = GUILayoutUtility.GetRect(TimelineWidth, 24f, GUILayout.Width(TimelineWidth));
             EditorGUI.DrawRect(rect, new Color(0.14f, 0.14f, 0.14f));
             var content = ContentRect(rect);
             for (var i = 0; i <= 10; i++)
@@ -408,73 +566,127 @@ namespace ChnnAsn.Montage.Editor
             DrawPlayhead(rect, duration);
         }
 
-        private void DrawSections(float duration)
+        private void DrawAudioEvents(float duration)
         {
             duration = Mathf.Max(0.001f, duration);
-            var rect = GUILayoutUtility.GetRect(position.width - 20f, RowHeight);
-            DrawRowBackground(rect, 0);
-            GUI.Label(new Rect(rect.x + 4f, rect.y + 5f, HeaderWidth - 8f, 20f), "Sections");
-            var content = ContentRect(rect);
-            for (var i = 0; i < montage.Sections.Count; i++)
-            {
-                var section = montage.Sections[i];
-                if (section == null)
-                    continue;
-                var sectionRect = TimeRect(content, section.StartTime, section.EndTime, duration);
-                EditorGUI.DrawRect(sectionRect, new Color(0.25f, 0.48f, 0.72f));
-                GUI.Label(sectionRect, section.Name, EditorStyles.miniLabel);
-            }
-            DrawPlayhead(rect, duration);
-        }
-
-        private void DrawTrack(MontageSlotTrack track, float duration, int row)
-        {
-            if (track == null)
-                return;
-            duration = Mathf.Max(0.001f, duration);
-            var rect = GUILayoutUtility.GetRect(position.width - 20f, RowHeight);
-            DrawRowBackground(rect, row + 1);
-            GUI.Label(new Rect(rect.x + 4f, rect.y + 5f, HeaderWidth - 8f, 20f), track.Slot);
-            var content = ContentRect(rect);
-            for (var i = 0; i < track.Segments.Count; i++)
-            {
-                var segment = track.Segments[i];
-                if (segment == null || segment.Clip == null)
-                    continue;
-                var segmentRect = TimeRect(content, segment.StartTime, segment.EndTime, duration);
-                EditorGUI.DrawRect(segmentRect, track.Additive
-                    ? new Color(0.48f, 0.35f, 0.65f)
-                    : new Color(0.24f, 0.58f, 0.40f));
-                GUI.Label(segmentRect, segment.Clip.name, EditorStyles.miniLabel);
-            }
-            DrawPlayhead(rect, duration);
-        }
-
-        private void DrawNotifies(float duration)
-        {
-            duration = Mathf.Max(0.001f, duration);
-            var rect = GUILayoutUtility.GetRect(position.width - 20f, RowHeight);
+            var rect = GUILayoutUtility.GetRect(TimelineWidth, RowHeight, GUILayout.Width(TimelineWidth));
             DrawRowBackground(rect, montage.SlotTracks.Count + 1);
-            GUI.Label(new Rect(rect.x + 4f, rect.y + 5f, HeaderWidth - 8f, 20f), "Notifies");
+            GUI.Label(new Rect(rect.x + 4f, rect.y + 5f, HeaderWidth - 8f, 20f), "Audio");
             var content = ContentRect(rect);
+            DrawTimeGrid(content);
+
+            var hasEvents = false;
             for (var i = 0; i < montage.Notifies.Count; i++)
             {
                 var notify = montage.Notifies[i];
-                if (notify == null)
+                if (!(notify?.Asset is MontageAudioNotifyAsset audio))
                     continue;
-                var active = notify.IsState
-                    ? currentTime >= notify.Time && currentTime <= notify.EndTime
-                    : Mathf.Abs(currentTime - notify.Time) <= 1f / 30f;
-                var width = notify.IsState
-                    ? Mathf.Max(3f, content.width * notify.Duration / duration)
-                    : 3f;
-                var x = content.x + content.width * notify.Time / duration;
-                var notifyRect = new Rect(x, rect.y + 3f, width, rect.height - 6f);
-                EditorGUI.DrawRect(notifyRect, active
-                    ? new Color(1f, 0.82f, 0.22f)
-                    : new Color(0.9f, 0.58f, 0.18f));
+                hasEvents = true;
+                var eventDuration = audio.Clip != null
+                    ? audio.Clip.length / Mathf.Max(0.01f, Mathf.Abs(audio.Pitch))
+                    : 0.08f;
+                var eventRect = TimeRect(content, notify.Time,
+                    Mathf.Min(duration, notify.Time + Mathf.Max(0.08f, eventDuration)), duration);
+                DrawEventBlock(eventRect, i,
+                    audio.Clip != null ? audio.Clip.name : "Missing AudioClip",
+                    new Color(0.18f, 0.58f, 0.78f));
+                HandleNotifyInteraction(eventRect, content, duration, i);
             }
+
+            if (!hasEvents)
+                GUI.Label(content, "Drag AudioClip here", CenteredMiniLabel());
+            HandleEventDrop(content, duration, true);
             DrawPlayhead(rect, duration);
+        }
+
+        private void DrawVfxEvents(float duration)
+        {
+            duration = Mathf.Max(0.001f, duration);
+            var rect = GUILayoutUtility.GetRect(TimelineWidth, RowHeight, GUILayout.Width(TimelineWidth));
+            DrawRowBackground(rect, montage.SlotTracks.Count + 2);
+            GUI.Label(new Rect(rect.x + 4f, rect.y + 5f, HeaderWidth - 8f, 20f), "VFX");
+            var content = ContentRect(rect);
+            DrawTimeGrid(content);
+
+            var hasEvents = false;
+            for (var i = 0; i < montage.Notifies.Count; i++)
+            {
+                var notify = montage.Notifies[i];
+                if (!(notify?.Asset is MontageVfxNotifyAsset vfx))
+                    continue;
+                hasEvents = true;
+                var eventDuration = vfx.Lifetime > 0f ? vfx.Lifetime : 0.08f;
+                var eventRect = TimeRect(content, notify.Time,
+                    Mathf.Min(duration, notify.Time + Mathf.Max(0.08f, eventDuration)), duration);
+                DrawEventBlock(eventRect, i,
+                    vfx.Prefab != null ? vfx.Prefab.name : "Missing VFX Prefab",
+                    new Color(0.63f, 0.32f, 0.76f));
+                HandleNotifyInteraction(eventRect, content, duration, i);
+            }
+
+            if (!hasEvents)
+                GUI.Label(content, "Drag Prefab here", CenteredMiniLabel());
+            HandleEventDrop(content, duration, false);
+            DrawPlayhead(rect, duration);
+        }
+
+        private void DrawEventBlock(Rect rect, int notifyIndex, string label, Color color)
+        {
+            EditorGUI.DrawRect(rect, color);
+            if (notifyIndex == selectedNotifyIndex)
+            {
+                EditorGUI.DrawRect(new Rect(rect.x, rect.y, rect.width, 1f), Color.white);
+                EditorGUI.DrawRect(new Rect(rect.x, rect.yMax - 1f, rect.width, 1f), Color.white);
+                EditorGUI.DrawRect(new Rect(rect.x, rect.y, 1f, rect.height), Color.white);
+                EditorGUI.DrawRect(new Rect(rect.xMax - 1f, rect.y, 1f, rect.height), Color.white);
+            }
+            if (rect.width >= 28f)
+                GUI.Label(new Rect(rect.x + 3f, rect.y + 1f, rect.width - 6f, rect.height - 2f), label, EditorStyles.miniLabel);
+        }
+
+        private void HandleNotifyInteraction(Rect eventRect, Rect content, float duration, int notifyIndex)
+        {
+            HandleElementInteraction(eventRect, content, duration, SelectionKind.Notify, -1, notifyIndex);
+        }
+
+        private void HandleEventDrop(Rect content, float duration, bool audioLane)
+        {
+            var current = Event.current;
+            if (!content.Contains(current.mousePosition) ||
+                (current.type != EventType.DragUpdated && current.type != EventType.DragPerform))
+                return;
+
+            var compatible = false;
+            for (var i = 0; i < DragAndDrop.objectReferences.Length; i++)
+            {
+                if ((audioLane && DragAndDrop.objectReferences[i] is AudioClip) ||
+                    (!audioLane && DragAndDrop.objectReferences[i] is GameObject))
+                {
+                    compatible = true;
+                    break;
+                }
+            }
+            if (!compatible)
+                return;
+
+            DragAndDrop.visualMode = DragAndDropVisualMode.Copy;
+            if (current.type == EventType.DragUpdated)
+            {
+                current.Use();
+                return;
+            }
+
+            DragAndDrop.AcceptDrag();
+            var normalized = Mathf.InverseLerp(content.x, content.xMax, current.mousePosition.x);
+            var time = Mathf.Clamp01(normalized) * duration;
+            for (var i = 0; i < DragAndDrop.objectReferences.Length; i++)
+            {
+                if (audioLane && DragAndDrop.objectReferences[i] is AudioClip clip)
+                    AddAudioEvent(clip, time);
+                else if (!audioLane && DragAndDrop.objectReferences[i] is GameObject prefab)
+                    AddVfxEvent(prefab, time);
+            }
+            current.Use();
         }
 
         private void HandleTimelineScrub(Rect content, float duration)
@@ -485,8 +697,115 @@ namespace ChnnAsn.Montage.Editor
                 return;
             isPlaying = false;
             var normalized = Mathf.InverseLerp(content.x, content.xMax, current.mousePosition.x);
-            SetTime(normalized * duration);
+            SetTime(SnapTime(normalized * duration));
             current.Use();
+        }
+
+        internal void AddAudioEvent(AudioClip clip, float time)
+        {
+            if (clip == null)
+                return;
+            var asset = CreateInstance<MontageAudioNotifyAsset>();
+            asset.name = $"Audio - {clip.name}";
+            var serialized = new SerializedObject(asset);
+            serialized.FindProperty("clip").objectReferenceValue = clip;
+            serialized.ApplyModifiedPropertiesWithoutUndo();
+            AddNotifyAsset(asset, time, "Add Montage Audio Event");
+        }
+
+        internal void AddVfxEvent(GameObject prefab, float time)
+        {
+            if (prefab == null)
+                return;
+            var asset = CreateInstance<MontageVfxNotifyAsset>();
+            asset.name = $"VFX - {prefab.name}";
+            var serialized = new SerializedObject(asset);
+            serialized.FindProperty("prefab").objectReferenceValue = prefab;
+            serialized.ApplyModifiedPropertiesWithoutUndo();
+            AddNotifyAsset(asset, time, "Add Montage VFX Event");
+        }
+
+        private void AddNotifyAsset(MontageNotifyAsset asset, float time, string undoName)
+        {
+            if (montage == null || asset == null)
+                return;
+            var montagePath = AssetDatabase.GetAssetPath(montage);
+            if (string.IsNullOrEmpty(montagePath))
+            {
+                DestroyImmediate(asset);
+                previewError = "Save the MontageAsset before adding Audio or VFX events.";
+                Repaint();
+                return;
+            }
+
+            Undo.RecordObject(montage, undoName);
+            Undo.RegisterCreatedObjectUndo(asset, undoName);
+            asset.hideFlags = HideFlags.HideInHierarchy;
+            AssetDatabase.AddObjectToAsset(asset, montage);
+
+            var serializedMontage = new SerializedObject(montage);
+            var notifies = serializedMontage.FindProperty("notifies");
+            var index = notifies.arraySize;
+            notifies.InsertArrayElementAtIndex(index);
+            var notify = notifies.GetArrayElementAtIndex(index);
+            notify.FindPropertyRelative("id").stringValue = Guid.NewGuid().ToString("N");
+            notify.FindPropertyRelative("eventName").stringValue = string.Empty;
+            notify.FindPropertyRelative("track").intValue = 0;
+            notify.FindPropertyRelative("time").floatValue = Mathf.Clamp(time, 0f, montage.Duration);
+            notify.FindPropertyRelative("duration").floatValue = 0f;
+            notify.FindPropertyRelative("notify").objectReferenceValue = asset;
+            serializedMontage.ApplyModifiedPropertiesWithoutUndo();
+
+            EditorUtility.SetDirty(asset);
+            EditorUtility.SetDirty(montage);
+            AssetDatabase.ImportAsset(montagePath);
+            AssetDatabase.SaveAssets();
+            selectedNotifyIndex = index;
+            selectionKind = SelectionKind.Notify;
+            Selection.activeObject = asset;
+            Repaint();
+        }
+
+        internal void RemoveNotify(int index)
+        {
+            if (montage == null || index < 0 || index >= montage.Notifies.Count)
+                return;
+
+            var asset = montage.Notifies[index]?.Asset;
+            var montagePath = AssetDatabase.GetAssetPath(montage);
+            var ownsBuiltInAsset = asset != null &&
+                                   AssetDatabase.IsSubAsset(asset) &&
+                                   AssetDatabase.GetAssetPath(asset) == montagePath &&
+                                   (asset is MontageAudioNotifyAsset || asset is MontageVfxNotifyAsset);
+
+            Undo.RecordObject(montage, "Remove Montage Event");
+            var serialized = new SerializedObject(montage);
+            var notifies = serialized.FindProperty("notifies");
+            notifies.DeleteArrayElementAtIndex(index);
+            serialized.ApplyModifiedPropertiesWithoutUndo();
+            var stillReferenced = false;
+            foreach (var entry in montage.Notifies)
+                stillReferenced |= entry != null && entry.Asset == asset;
+            if (ownsBuiltInAsset && !stillReferenced)
+                Undo.DestroyObjectImmediate(asset);
+
+            EditorUtility.SetDirty(montage);
+            AssetDatabase.SaveAssets();
+            selectedNotifyIndex = -1;
+            selectionKind = SelectionKind.Asset;
+            Repaint();
+        }
+
+        private static void DrawTimeGrid(Rect content)
+        {
+            for (var i = 0; i <= 10; i++)
+            {
+                var x = Mathf.Lerp(content.x, content.xMax, i / 10f);
+                var color = i == 0 || i == 10
+                    ? new Color(0.42f, 0.42f, 0.42f, 0.65f)
+                    : i == 5 ? new Color(0.38f, 0.38f, 0.38f, 0.55f) : new Color(0.28f, 0.28f, 0.28f, 0.45f);
+                EditorGUI.DrawRect(new Rect(x, content.y, 1f, content.height), color);
+            }
         }
 
         private void DrawPlayhead(Rect row, float duration)
@@ -529,6 +848,9 @@ namespace ChnnAsn.Montage.Editor
         private void OnUndoRedo()
         {
             pendingRebuild = true;
+            draggingElement = false;
+            selectionKind = SelectionKind.Asset;
+            selectedNotifyIndex = -1;
             Repaint();
         }
 
@@ -545,6 +867,14 @@ namespace ChnnAsn.Montage.Editor
             {
                 alignment = TextAnchor.MiddleCenter,
                 normal = { textColor = new Color(0.72f, 0.72f, 0.72f) }
+            };
+        }
+
+        private static GUIStyle CenteredMiniLabel()
+        {
+            return new GUIStyle(EditorStyles.centeredGreyMiniLabel)
+            {
+                alignment = TextAnchor.MiddleCenter
             };
         }
 

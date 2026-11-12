@@ -22,5 +22,7 @@ Additive Slot Mixer ────────────────────
 - `MontagePlayOptions`: start section, play rate, priority, and blend-in options.
 - `MontageNotifyAsset`: extension point for point and state notifications.
 - `IMontageRootMotionReceiver`: optional integration with a character motor.
+- `IKRetargeterAsset`: Humanoid chain maps, Retarget Poses, root scaling, and IK settings.
+- `MontageIKRetargeter`: runtime pose correction and hand/foot two-bone IK.
 
-See [Getting Started](getting-started.md), [Montage Preview](montage-preview.md), and [Runtime API](runtime-api.md).
+See [Getting Started](getting-started.md), [Montage Preview](montage-preview.md), [IK Retargeter](ik-retargeter.md), and [Runtime API](runtime-api.md).

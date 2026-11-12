@@ -6,6 +6,7 @@ namespace ChnnAsn.Montage
         public float PlayRate;
         public int Priority;
         public float BlendIn;
+        public float StartTime;
 
         public static MontagePlayOptions Default => new MontagePlayOptions
         {
@@ -16,6 +17,13 @@ namespace ChnnAsn.Montage
         public MontagePlayOptions WithSection(string section)
         {
             StartSection = section;
+            return this;
+        }
+
+        public MontagePlayOptions WithStartTime(float seconds)
+        {
+            StartTime = seconds;
+            StartSection = null;
             return this;
         }
 
